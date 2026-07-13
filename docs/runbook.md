@@ -5,24 +5,24 @@
 ---
 
 ## 1. 把项目同步到 4×L20
-任选一种(假设你的开发机能与 L20 机器 SSH 互通):
+仓库已经是标准 git 仓库，**官方代码用 submodule 管理**。最干净的方式是带 submodule 一起 clone:
 
 ```bash
-# 方式 A:rsync(推荐,保留目录结构)
-rsync -avz --exclude '.venv' --exclude '.git' \
-  /Users/wenjiayu/WorkBuddy/2026-07-13-22-49-06/gated_attention_repro/ \
-  <user>@<l20-host>:~/gated_attention_repro/
-
-# 方式 B:先 git init 推到私有仓,再到 L20 上 clone
-```
-
-进入 L20 机器后:
-
-```bash
-ssh <user>@<l20-host>
+# 在 4×L20 上(假设已配好 SSH key 或 HTTPS 凭证)
+git clone --recurse-submodules <你的仓库URL> ~/gated_attention_repro
 cd ~/gated_attention_repro
 nvidia-smi          # 确认 4 张 L20 可见
 ```
+
+> ⚠️ 必须加 `--recurse-submodules`(或之后 `git submodule update --init`),
+> 否则 `src/official/` 会是空目录,`model_builder` 会因找不到官方类而报错。
+> 如果只想要本地拷贝而不碰 git,也可用 rsync(但要排除 `.git` 并手动保留
+> `src/official/` 的文件):
+> ```bash
+> rsync -avz --exclude '.venv' --exclude '.git' \
+>   /Users/wenjiayu/WorkBuddy/2026-07-13-22-49-06/gated_attention_repro/ \
+>   <user>@<l20-host>:~/gated_attention_repro/
+> ```
 
 ## 2. 建 Python 环境(CUDA 版 torch)——**版本必须钉死**
 
