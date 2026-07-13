@@ -1,0 +1,3 @@
+[submodule "src/official"]
+	path = src/official
+	url = https://github.com/qiuzh20/gated_attention

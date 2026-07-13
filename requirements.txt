@@ -1,0 +1,20 @@
+# Pinned for faithful reproduction of Gated Attention (NeurIPS 2025).
+#
+# IMPORTANT: the official modeling_qwen3.py targets transformers 4.x.
+# transformers >= 5.0 silently breaks it (config.qkv_bias,
+# ROPE_INIT_FUNCTIONS['default'], implicit pad_token_id all gone).
+# We verified the gate sanity check only passes on 4.51.x.
+transformers==4.51.3
+
+# torch is installed separately (CUDA wheel on the 4xL20, CPU wheel on mac):
+#   L20 : pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   mac : pip install torch --index-url https://download.pytorch.org/whl/cpu
+# Pin a 2.x that pairs with 4.51.3:
+torch>=2.1,<2.6
+
+numpy
+matplotlib
+safetensors
+huggingface_hub
+datasets
+accelerate

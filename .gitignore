@@ -1,0 +1,29 @@
+# ---- Python ----
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# ---- Model weights & caches (DO NOT COMMIT — large) ----
+models_1b/
+outputs/
+data/tinystories_*
+**/*.safetensors
+**/*.bin
+**/*.pt
+**/*.pth
+.huggingface/
+~/.cache/huggingface/
+
+# ---- Generated eval artifacts (keep JSON if desired; ignore heavy media) ----
+results/**/*.png
+results/**/*.pdf
+
+# ---- OS / editor ----
+.DS_Store
+.idea/
+.vscode/
+
+# ---- Secrets ----
+*.token
+.env
