@@ -8,6 +8,8 @@ __pycache__/
 models_1b/
 outputs/
 data/tinystories_*
+data/fineweb_edu_*
+data/.*.build-*/
 **/*.safetensors
 **/*.bin
 **/*.pt

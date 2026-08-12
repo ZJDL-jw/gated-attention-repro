@@ -1,208 +1,319 @@
-"""Phase B: train a small gated-attention model from scratch and track the
-attention-sink metric during training.
+"""Train one gated-attention variant with reproducible, token-based settings."""
+from __future__ import annotations
 
-This is the heart of the self-reproduction. We train THREE variants
-(baseline / headwise / elementwise) from the SAME config and SAME data, then
-compare (a) downstream loss, (b) training stability (loss spikes), and
-(c) the attention-sink rate measured on a fixed probe prompt every N steps.
-
-Run on the 4xL20 with accelerate (4 processes == 4 GPUs):
-    accelerate launch --num_processes 4 src/our/train.py \
-        --variant headwise \
-        --config configs/qwen3_tiny.json \
-        --data_dir data/tinystories_50M \
-        --output_dir outputs/headwise
-
-Or a single-GPU smoke test:
-    python src/our/train.py --variant baseline \
-        --config configs/qwen3_tiny.json \
-        --data_dir data/tinystories_50M --max_steps 50 \
-        --output_dir /tmp/smoke_baseline
-
-We reuse the attention extractors from eval_attention so train/eval share
-exactly the same sink definition.
-"""
 import argparse
+import importlib.metadata
 import json
+import math
 import os
+from pathlib import Path
 
 import torch
-from datasets import load_from_disk
+from datasets import DatasetDict, load_from_disk
 from transformers import (
     AutoTokenizer,
     DataCollatorForLanguageModeling,
     Trainer,
-    TrainingArguments,
     TrainerCallback,
+    TrainingArguments,
+    set_seed,
 )
 
-from model_builder import build_model, VARIANTS
-from eval_attention import first_token_rate, extract, load_model, plot_maps
+from metrics import read_data_meta
+from model_builder import VARIANTS, build_model
 
 
-# --- gate flags must NEVER be overridden by the config file; the variant wins.
 GATE_FLAGS = ("headwise_attn_output_gate", "elementwise_attn_output_gate")
 
 
-def load_config(path, variant):
-    with open(path) as f:
-        cfg = json.load(f)
-    for k in GATE_FLAGS:
-        cfg.pop(k, None)  # variant decides these
-    return cfg
+def load_config(path):
+    with open(path) as handle:
+        config = json.load(handle)
+    for key in GATE_FLAGS:
+        config.pop(key, None)
+    # Human-readable JSON notes are not model constructor arguments.
+    return {key: value for key, value in config.items() if not key.startswith("_")}
 
 
-class SinkTracker(TrainerCallback):
-    """Every `every_steps`, run a forward pass on a probe prompt with
-    output_attentions=True and record the mean first-token attention rate
-    (the attention-sink proxy). Produces sink_curve_{variant}.jsonl."""
+def _barrier():
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
-    def __init__(self, tokenizer, device, prompt, every_steps, out_jsonl):
-        self.tokenizer = tokenizer
-        self.device = device
-        self.prompt = prompt
-        self.every = every_steps
-        self.out = out_jsonl
-        self.enc = tokenizer(prompt, return_tensors="pt")["input_ids"]
+
+def validate_output_dir(path, resume_from_checkpoint=None):
+    """Reject accidental from-scratch reuse of a non-empty run directory."""
+    output_dir = Path(path)
+    if (
+        output_dir.exists()
+        and any(output_dir.iterdir())
+        and resume_from_checkpoint is None
+    ):
+        raise FileExistsError(
+            f"{output_dir} is not empty; choose a new --output_dir or pass "
+            "--resume_from_checkpoint"
+        )
+    return output_dir
+
+
+def validate_tokenizer(data_meta, tokenizer_name, tokenizer, config):
+    """Ensure stored token ids and the tokenizer saved with the run agree."""
+    prepared_with = data_meta.get("tokenizer")
+    if prepared_with and prepared_with != tokenizer_name:
+        raise ValueError(
+            f"Dataset was prepared with tokenizer {prepared_with!r}, but training "
+            f"requested {tokenizer_name!r}"
+        )
+    prepared_eos = data_meta.get("eos_token_id")
+    if prepared_eos is not None and tokenizer.eos_token_id != prepared_eos:
+        raise ValueError(
+            f"Dataset EOS id {prepared_eos} does not match tokenizer EOS id "
+            f"{tokenizer.eos_token_id}"
+        )
+    if len(tokenizer) > int(config.vocab_size):
+        raise ValueError(
+            f"Tokenizer size {len(tokenizer)} exceeds model vocab_size "
+            f"{config.vocab_size}"
+        )
+
+
+def mixed_precision_flags(bf16_requested, use_cuda):
+    """Select BF16 when supported, otherwise fall back to FP16 on CUDA."""
+    bf16_supported = use_cuda and torch.cuda.is_bf16_supported()
+    return {
+        "bf16": bool(bf16_requested and bf16_supported),
+        "fp16": bool(bf16_requested and use_cuda and not bf16_supported),
+    }
+
+
+class AnalysisSnapshotCallback(TrainerCallback):
+    """Save model-only snapshots at the same steps as Trainer checkpoints."""
+
+    def __init__(self, output_dir, milestone_steps):
+        self.root = Path(output_dir) / "analysis_snapshots"
+        self.milestones = set(milestone_steps)
+        self.saved = set()
+
+    def _save(self, state, model):
+        step = state.global_step
+        if step in self.saved or step not in self.milestones:
+            return
+        _barrier()
+        if state.is_world_process_zero:
+            destination = self.root / f"step-{step:08d}"
+            destination.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(destination, safe_serialization=True)
+            (destination / "snapshot.json").write_text(
+                json.dumps({"step": step}, indent=2)
+            )
+            print(f"[snapshot] step={step} -> {destination}")
+        _barrier()
+        self.saved.add(step)
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        self._save(state, model)
+        return control
 
     def on_step_end(self, args, state, control, model=None, **kwargs):
-        if not state.is_world_process_zero:
-            return control
-        if state.global_step % self.every != 0:
-            return control
-        dev = next(model.parameters()).device
-        ids = self.enc.to(dev)
-        with torch.no_grad():
-            out = model(input_ids=ids, output_attentions=True)
-        rates = first_token_rate(out.attentions)
-        last_loss = state.log_history[-1].get("loss") if state.log_history else None
-        row = dict(
-            step=state.global_step,
-            loss=last_loss,
-            mean_first_token_rate=sum(rates) / len(rates),
-            per_layer=rates,
-        )
-        with open(self.out, "a") as f:
-            f.write(json.dumps(row) + "\n")
+        self._save(state, model)
         return control
 
 
-def post_eval(variant, output_dir, prompt, layers):
-    """After training, load the saved checkpoint and produce attention maps +
-    a results json, identical in format to Phase A (so they compare directly)."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = load_model(output_dir, device)
-    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
-    inputs = tok(prompt, return_tensors="pt")
-    tokens = tok.convert_ids_to_tokens(inputs["input_ids"][0])
-    logits, atts = extract(model, inputs["input_ids"], device)
-    rates = first_token_rate(atts)
-    n_layers = len(atts)
-    req = [int(x) for x in layers.split(",")]
-    plot_layers = [min(i, n_layers - 1) for i in req]
-
-    res = dict(
-        variant=f"{variant}_trained",
-        n_layers=n_layers,
-        per_layer_first_token_rate=rates,
-        mean_first_token_rate=sum(rates) / len(rates),
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--variant", required=True, choices=VARIANTS)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--data_dir", required=True)
+    parser.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B")
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--per_device_train_batch_size", type=int, default=4)
+    parser.add_argument("--per_device_eval_batch_size", type=int, default=1)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--target_train_tokens", type=int, default=20_000_000)
+    parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--warmup_steps", type=int, default=100)
+    parser.add_argument("--logging_steps", type=int, default=10)
+    parser.add_argument("--eval_steps", type=int, default=None)
+    parser.add_argument("--save_steps", type=int, default=None)
+    parser.add_argument("--analysis_checkpoints", type=int, default=8)
+    parser.add_argument("--save_total_limit", type=int, default=2)
+    parser.add_argument("--trainer_eval_tokens", type=int, default=1_048_576)
+    parser.add_argument("--seed", type=int, default=20)
+    parser.add_argument(
+        "--bf16", action=argparse.BooleanOptionalAction, default=True
     )
-    with open(os.path.join(output_dir, f"results_{variant}_trained.json"), "w") as f:
-        json.dump(res, f, indent=2)
-    plot_maps(atts, tokens, plot_layers,
-              os.path.join(output_dir, f"attention_maps_{variant}_trained.png"),
-              title=f"{variant}_trained")
-    print(f"[post_eval:{variant}] mean first-token rate "
-          f"{res['mean_first_token_rate']:.4f} -> results_{variant}_trained.json")
+    parser.add_argument(
+        "--tf32", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--gradient_checkpointing", action="store_true")
+    parser.add_argument("--dataloader_num_workers", type=int, default=4)
+    parser.add_argument("--resume_from_checkpoint", default=None)
+    parser.add_argument(
+        "--analyze_after_train",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--analysis_context_lengths", default="512,1024,2048,4096")
+    parser.add_argument("--analysis_ppl_tokens", type=int, default=131_072)
+    parser.add_argument("--analysis_sink_length", type=int, default=512)
+    parser.add_argument("--analysis_sink_samples", type=int, default=8)
+    return parser.parse_args()
+
+
+def package_versions():
+    versions = {}
+    for package in ("torch", "transformers", "datasets", "accelerate"):
+        try:
+            versions[package] = importlib.metadata.version(package)
+        except importlib.metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--variant", required=True, choices=VARIANTS)
-    ap.add_argument("--config", required=True, help="path to qwen3_tiny.json")
-    ap.add_argument("--data_dir", required=True, help="output of prep_data.py")
-    ap.add_argument("--tokenizer", default="Qwen/Qwen3-0.6B")
-    ap.add_argument("--output_dir", required=True)
-    ap.add_argument("--block_size", type=int, default=2048)
-    ap.add_argument("--per_device_train_batch_size", type=int, default=4)
-    ap.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    ap.add_argument("--learning_rate", type=float, default=3e-4)
-    ap.add_argument("--max_steps", type=int, default=3000)
-    ap.add_argument("--num_train_epochs", type=float, default=None)
-    ap.add_argument("--warmup_steps", type=int, default=100)
-    ap.add_argument("--logging_steps", type=int, default=10)
-    ap.add_argument("--save_steps", type=int, default=1000)
-    ap.add_argument("--save_total_limit", type=int, default=2)
-    ap.add_argument("--sink_eval_steps", type=int, default=100,
-                    help="how often to probe the attention-sink rate")
-    ap.add_argument("--sink_prompt",
-                    default="The gating mechanism lets the model decide which "
-                            "tokens to attend to, reducing attention sink.")
-    ap.add_argument("--layers", default="0,3,7,11",
-                    help="layers to visualize in post-eval (tiny model = 12)")
-    ap.add_argument("--seed", type=int, default=20)
-    ap.add_argument("--bf16", action="store_true", default=True)
-    args = ap.parse_args()
+    args = parse_args()
+    set_seed(args.seed)  # Must happen before model construction.
+    output_dir = Path(args.output_dir)
+    if int(os.environ.get("RANK", "0")) == 0:
+        output_dir = validate_output_dir(
+            args.output_dir, resume_from_checkpoint=args.resume_from_checkpoint
+        )
 
-    cfg = load_config(args.config, args.variant)
-    model = build_model(args.variant, **cfg)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[train] variant={args.variant}  params={n_params/1e6:.2f}M")
+    data = load_from_disk(args.data_dir)
+    if not isinstance(data, DatasetDict):
+        raise TypeError(
+            "Training data must be a DatasetDict from the new prep_data.py"
+        )
+    if "train" not in data or "validation" not in data:
+        raise KeyError("Training data requires train and validation splits")
 
-    tok = AutoTokenizer.from_pretrained(args.tokenizer)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
+    data_meta = read_data_meta(args.data_dir)
+    block_size = int(data_meta.get("block_size", len(data["train"][0]["input_ids"])))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    tokens_per_step = (
+        world_size
+        * args.per_device_train_batch_size
+        * args.gradient_accumulation_steps
+        * block_size
+    )
+    max_steps = args.max_steps or math.ceil(args.target_train_tokens / tokens_per_step)
+    save_steps = args.save_steps or max(1, math.ceil(max_steps / args.analysis_checkpoints))
+    eval_steps = args.eval_steps or save_steps
+    milestones = set(range(0, max_steps + 1, save_steps))
+    milestones.add(max_steps)
 
-    train_ds = load_from_disk(args.data_dir)
-    collator = DataCollatorForLanguageModeling(tok, mlm=False)
+    config = load_config(args.config)
+    config["use_cache"] = False
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model = build_model(args.variant, **config)
+    validate_tokenizer(data_meta, args.tokenizer, tokenizer, model.config)
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
 
-    # training-args: bf16 + multi-GPU via accelerate (num_processes=4).
-    targs = TrainingArguments(
+    eval_blocks = max(1, math.ceil(args.trainer_eval_tokens / block_size))
+    eval_dataset = data["validation"].select(
+        range(min(eval_blocks, len(data["validation"])))
+    )
+
+    use_cuda = torch.cuda.is_available()
+    precision = mixed_precision_flags(args.bf16, use_cuda)
+    tf32 = args.tf32 and use_cuda
+    training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.per_device_train_batch_size,
+        per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
-        max_steps=args.max_steps,
-        num_train_epochs=args.num_train_epochs,
-        warmup_steps=args.warmup_steps,
+        max_steps=max_steps,
+        warmup_steps=min(args.warmup_steps, max_steps),
+        logging_strategy="steps",
         logging_steps=args.logging_steps,
+        eval_strategy="steps",
+        eval_steps=eval_steps,
         save_strategy="steps",
-        save_steps=args.save_steps,
+        save_steps=save_steps,
         save_total_limit=args.save_total_limit,
-        bf16=args.bf16,
-        tf32=True,
+        bf16=precision["bf16"],
+        fp16=precision["fp16"],
+        tf32=tf32,
         report_to="none",
         seed=args.seed,
+        data_seed=args.seed,
         optim="adamw_torch",
         lr_scheduler_type="cosine",
-        dataloader_num_workers=4,
+        dataloader_num_workers=args.dataloader_num_workers,
         disable_tqdm=False,
+        prediction_loss_only=True,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
-    sink_jsonl = os.path.join(args.output_dir, f"sink_curve_{args.variant}.jsonl")
-    tracker = SinkTracker(tok, "cpu", args.sink_prompt, args.sink_eval_steps, sink_jsonl)
+    if training_args.process_index == 0:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tokenizer.save_pretrained(output_dir / "tokenizer")
+        manifest = {
+            "variant": args.variant,
+            "seed": args.seed,
+            "parameter_count": parameter_count,
+            "data_dir": str(Path(args.data_dir).resolve()),
+            "data_meta": data_meta,
+            "world_size": world_size,
+            "block_size": block_size,
+            "tokens_per_step": tokens_per_step,
+            "target_train_tokens": args.target_train_tokens,
+            "planned_processed_tokens": max_steps * tokens_per_step,
+            "max_steps": max_steps,
+            "save_steps": save_steps,
+            "analysis_milestones": sorted(milestones),
+            "learning_rate": args.learning_rate,
+            "per_device_train_batch_size": args.per_device_train_batch_size,
+            "gradient_accumulation_steps": args.gradient_accumulation_steps,
+            "packages": package_versions(),
+            "cuda_available": use_cuda,
+            "gpu_names": [
+                torch.cuda.get_device_name(index)
+                for index in range(torch.cuda.device_count())
+            ],
+        }
+        with (output_dir / "run_manifest.json").open("w") as handle:
+            json.dump(manifest, handle, indent=2)
 
+    snapshot_callback = AnalysisSnapshotCallback(args.output_dir, milestones)
     trainer = Trainer(
         model=model,
-        args=targs,
-        train_dataset=train_ds,
+        args=training_args,
+        train_dataset=data["train"],
+        eval_dataset=eval_dataset,
         data_collator=collator,
-        callbacks=[tracker],
+        callbacks=[snapshot_callback],
     )
-    print(f"[train] starting training on "
-          f"{'cuda' if torch.cuda.is_available() else 'cpu'} "
-          f"(max_steps={args.max_steps}) ...")
-    trainer.train()
-
+    print(
+        f"[train] variant={args.variant} params={parameter_count/1e6:.2f}M "
+        f"steps={max_steps:,} tokens/step={tokens_per_step:,}"
+    )
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model(args.output_dir)
-    # save the *variant config* so evaluation knows which gate is active
-    with open(os.path.join(args.output_dir, "variant.txt"), "w") as f:
-        f.write(args.variant)
-    print(f"[train] saved checkpoint -> {args.output_dir}")
+    if trainer.is_world_process_zero():
+        trainer.state.save_to_json(str(output_dir / "trainer_state.json"))
+        (output_dir / "variant.txt").write_text(args.variant)
+        print(f"[train] saved final model -> {output_dir}")
 
-    if trainer.is_world_process_zero:
-        post_eval(args.variant, args.output_dir, args.sink_prompt, args.layers)
-        print(f"[train] sink curve -> {sink_jsonl}")
+        if args.analyze_after_train:
+            from analyze_checkpoints import analyze_run
+
+            analyze_run(
+                run_dir=output_dir,
+                data_dir=Path(args.data_dir),
+                variant=args.variant,
+                context_lengths=[
+                    int(value) for value in args.analysis_context_lengths.split(",")
+                ],
+                ppl_tokens=args.analysis_ppl_tokens,
+                sink_length=args.analysis_sink_length,
+                sink_samples=args.analysis_sink_samples,
+                device="cuda" if use_cuda else "cpu",
+            )
 
 
 if __name__ == "__main__":

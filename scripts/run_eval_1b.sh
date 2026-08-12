@@ -1,34 +1,49 @@
 #!/usr/bin/env bash
-# Phase A on the 4xL20 machine.
-# 1) downloads the released 1B models if missing
-# 2) runs eval_attention.py for each of the three variants
-# 3) aggregates results into a comparison table + chart
+# Phase A: evaluate the three released 1B checkpoints on one validation split.
 set -euo pipefail
 
 PROJ="${PROJ:-$(pwd)}"
 cd "$PROJ"
 
 MODELS_DIR="${MODELS_DIR:-./models_1b}"
+EVAL_DATA_DIR="${EVAL_DATA_DIR:-./data/fineweb_edu_eval}"
 OUT="${OUT:-./results/phaseA}"
-VARIANTS="baseline gate_headwise gate_elementwise"
+VARIANTS="${VARIANTS:-baseline gate_headwise gate_elementwise}"
 
-# 1) fetch the official 1B models (each ~2GB; needs ~6GB free)
-if [ ! -d "$MODELS_DIR/1B_baseline" ]; then
-  echo "[run_eval_1b] downloading 1B models from HF (QwQZh/gated_attention)..."
-  huggingface-cli download QwQZh/gated_attention --include "1B_*/*" --local-dir "$MODELS_DIR"
+if [ ! -f "$EVAL_DATA_DIR/meta.json" ]; then
+  python src/our/prep_data.py \
+    --dataset_name HuggingFaceFW/fineweb-edu \
+    --dataset_config default \
+    --tokenizer Qwen/Qwen3-0.6B \
+    --block_size 2048 \
+    --train_tokens 2048000 \
+    --validation_tokens 2048000 \
+    --streaming \
+    --overwrite \
+    --output_dir "$EVAL_DATA_DIR"
 fi
 
-# 2) evaluate each variant
-for v in $VARIANTS; do
-  echo "[run_eval_1b] evaluating $v ..."
+if [ ! -d "$MODELS_DIR/1B_baseline" ]; then
+  echo "[phaseA] downloading official 1B checkpoints..."
+  if command -v hf >/dev/null 2>&1; then
+    hf download QwQZh/gated_attention --include "1B_*/*" --local-dir "$MODELS_DIR"
+  else
+    huggingface-cli download QwQZh/gated_attention \
+      --include "1B_*/*" --local-dir "$MODELS_DIR"
+  fi
+fi
+
+for variant in $VARIANTS; do
   python src/our/eval_attention.py \
-    --model_path "$MODELS_DIR/1B_$v" \
-    --variant "$v" \
+    --model_path "$MODELS_DIR/1B_$variant" \
+    --variant "$variant" \
     --output_dir "$OUT" \
-    --prompt "Sparse gating mechanism mitigates attention sink." \
-    --ppl_text ./data/ppl_sample.txt
+    --eval_data_dir "$EVAL_DATA_DIR" \
+    --ppl_context_length 1024 \
+    --ppl_max_tokens 262144 \
+    --sink_context_length 512 \
+    --sink_samples 16
 done
 
-# 3) aggregate
 python src/our/aggregate_results.py --results_dir "$OUT"
-echo "[run_eval_1b] DONE. Results in $OUT"
+echo "[phaseA] DONE -> $OUT"

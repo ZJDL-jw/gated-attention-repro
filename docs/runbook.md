@@ -1,78 +1,124 @@
-# 上机手册:在你的 4×L20 上跑 Phase A(验证官方 1B 模型)
+# 4×L20 / 单卡云 GPU 运行手册
 
-本仓库现在在 **macOS 开发机**(WorkBuddy 环境)里。真正的 GPU 训练/评测在你的 **4×L20(Linux)** 上做。下面是把代码搬过去并验证官方 1B 模型的步骤。
+完整实验设计见 [`reproduction_plan.md`](reproduction_plan.md)。本文件只保留上机步骤。
 
----
-
-## 1. 把项目同步到 4×L20
-仓库已经是标准 git 仓库，**官方代码用 submodule 管理**。最干净的方式是带 submodule 一起 clone:
+## 1. 获取仓库
 
 ```bash
-# 在 4×L20 上(假设已配好 SSH key 或 HTTPS 凭证)
-git clone --recurse-submodules <你的仓库URL> ~/gated_attention_repro
-cd ~/gated_attention_repro
-nvidia-smi          # 确认 4 张 L20 可见
+git clone --recurse-submodules <repository-url> ~/gated-attention-repro
+cd ~/gated-attention-repro
+git submodule status
 ```
 
-> ⚠️ 必须加 `--recurse-submodules`(或之后 `git submodule update --init`),
-> 否则 `src/official/` 会是空目录,`model_builder` 会因找不到官方类而报错。
-> 如果只想要本地拷贝而不碰 git,也可用 rsync(但要排除 `.git` 并手动保留
-> `src/official/` 的文件):
-> ```bash
-> rsync -avz --exclude '.venv' --exclude '.git' \
->   /Users/wenjiayu/WorkBuddy/2026-07-13-22-49-06/gated_attention_repro/ \
->   <user>@<l20-host>:~/gated_attention_repro/
-> ```
+`src/official` 必须显示一个确定的 commit，不能是空目录。
 
-## 2. 建 Python 环境(CUDA 版 torch)——**版本必须钉死**
-
-> ⚠️ **关键坑(我们已踩过并验证)**:论文官方 `modeling_qwen3.py` 是为 **transformers 4.x** 写的。
-> 如果按 README 直接 `pip install transformers`(现在默认装 5.x),会在建模型时直接报错:
-> `config.qkv_bias` 不存在、`ROPE_INIT_FUNCTIONS['default']` 找不到、`pad_token_id` 缺失。
-> 我们已在开发机用 transformers 5.13 复现过这个崩溃,并确认降到 **4.51.3** 后门控逻辑全部通过。
-> 所以**必须钉版本**,否则你的 4×L20 训练会卡在同一步。
-
-L20 是 Ada 架构(compute 8.9),用 CUDA 12.x:
+## 2. 安装环境
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install --upgrade pip
-# 1) 先装 CUDA 版 torch(2.x,配对 4.51.3)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-# 2) 再装其余依赖,transformers 锁 4.51.3
+python -m pip install --upgrade pip
+pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r requirements.txt
-# 登录 HF(下载 1B 模型需要)
-huggingface-cli login
 ```
 
-`requirements.txt` 内容(已生成在仓库根目录):
-```
-transformers==4.51.3
-torch>=2.1,<2.6
-numpy / matplotlib / safetensors / huggingface_hub / datasets / accelerate
-```
+官方实现要求 `transformers==4.51.3`，不要升级到 Transformers 5。
 
-## 3. 跑 Phase A(一键)
+## 3. 环境检查
+
 ```bash
-PROJ=$(pwd) bash scripts/run_eval_1b.sh
+nvidia-smi
+python -m unittest discover -s tests -v
+python src/our/validate_gate.py
 ```
-脚本会:
-1. 若本地没有 `models_1b/1B_*`,自动从 `QwQZh/gated_attention` 下载(约 6GB);
-2. 对 `baseline / gate_headwise / gate_elementwise` 三个变体分别:
-   - 提取注意力 → 算**首 token 注意力占比**(attention sink 指标);
-   - 生成四层注意力图 PNG;
-   - 在 `data/ppl_sample.txt` 上算 PPL;
-3. 聚合成对比表 + 柱状图,存到 `results/phaseA/`。
 
-## 4. 你该看到什么(预期)
-- **baseline** 的 mean first-token attention rate 明显偏高(论文对 1.7B 报告 ~46.7%);
-- **gate_headwise / gate_elementwise** 显著更低(论文 ~4.8%);
-- 注意力图里 baseline 在第一列(首 token)有强亮带,门控变体没有。
+## 4. TinyStories smoke
 
-把 `results/phaseA/` 下的 `results_*.json` 和 `attention_sink_comparison.png` 发回给我,我陪你解读、并据此决定 Phase B 的训练规模与数据预算。
+单卡：
 
-## 5. 常见问题
-- **CUDA out of memory**:1B 模型单卡 48GB 绰绰有余;若报错,在 `eval_attention.py` 里把 `device` 固定为 `cuda:0` 并确认没有其他进程占显存(`nvidia-smi`)。
-- **下载慢/限流**:可手动 `huggingface-cli download QwQZh/gated_attention --include "1B_baseline/*" ...` 分组件下。
-- **trust_remote_code**:我们直接用仓库里的 `Qwen3ForCausalLM` 类加载,不需要 `trust_remote_code=True`;若用 `AutoModel` 加载则必须加该参数。
+```bash
+bash scripts/run_smoke.sh
+```
+
+四卡：
+
+```bash
+LAUNCH="accelerate launch --num_processes 4" bash scripts/run_smoke.sh
+```
+
+默认仅训练 2M tokens，目的是跑通全链路。较完整的 20M-token smoke：
+
+```bash
+TARGET_TOKENS=20000000 \
+LAUNCH="accelerate launch --num_processes 4" \
+bash scripts/run_smoke.sh
+```
+
+## 5. Phase A
+
+```bash
+bash scripts/run_eval_1b.sh
+```
+
+脚本会准备小型 FineWeb-Edu validation split、下载三个官方 1B checkpoint，生成
+dataset-level PPL、sink、gate、activation 和注意力图。
+
+## 6. FineWeb-Edu 正式训练
+
+```bash
+LAUNCH="accelerate launch --num_processes 4" bash scripts/run_train.sh
+```
+
+默认执行三个变体、seed 20、500M tokens。开始前先用 smoke 的 tokens/s 估算时间。
+
+## 7. 断点续训
+
+直接运行单个变体，并传入完整 Trainer checkpoint：
+
+```bash
+accelerate launch --num_processes 4 src/our/train.py \
+  --variant elementwise \
+  --config configs/qwen3_tiny.json \
+  --data_dir data/fineweb_edu_500m \
+  --output_dir outputs/fineweb_edu_500m/elementwise/seed-20 \
+  --target_train_tokens 500000000 \
+  --resume_from_checkpoint outputs/fineweb_edu_500m/elementwise/seed-20/checkpoint-<step>
+```
+
+为防止旧 snapshot 混入新实验，从头训练要求 `--output_dir` 为空；已有目录必须显式
+传入 `--resume_from_checkpoint`，或改用新的输出目录。
+
+## 8. 重新分析与汇总
+
+```bash
+bash scripts/run_analysis.sh
+```
+
+## 9. 常见问题
+
+### CUDA OOM
+
+降低每卡 batch，并用梯度累积保持 global batch：
+
+```bash
+python src/our/train.py ... \
+  --per_device_train_batch_size 1 \
+  --gradient_accumulation_steps 4
+```
+
+4096 长度分析默认 batch 1。若仍 OOM，降低 `--analysis_ppl_tokens`；不要删掉 4096
+这个评测点。
+
+### 数据准备占用磁盘
+
+增量 Arrow 构建期间会暂时同时存在构建缓存和最终数据。500M int32 token 至少预留
+约 8–12GB，模型、optimizer checkpoint 和 analysis snapshot 需要额外空间。
+
+### 下载中断
+
+重新运行脚本即可。已有完整目录不会重复准备；不完整数据目录需要确认后删除，再重新运行。
+
+### 离开公司网络
+
+只使用公司批准的 VPN、堡垒机或后台任务方式。不要自行建立反向隧道。长任务可在允许的
+情况下使用 `tmux`，个人云 GPU 则用于不含公司数据的个人实验。
