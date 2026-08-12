@@ -1,12 +1,10 @@
-"""Aggregate per-variant Phase A results into a comparison table + bar chart.
+"""Aggregate Phase A result JSON files into a table and comparison chart."""
+from __future__ import annotations
 
-Run:
-    python src/our/aggregate_results.py --results_dir results/phaseA
-"""
 import argparse
+import csv
 import json
-import os
-import glob
+from pathlib import Path
 
 import matplotlib
 
@@ -14,43 +12,87 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
+def flatten_result(result):
+    dataset = result.get("dataset")
+    if dataset:
+        probe = dataset["probe"]
+        gate = probe["gate"]["overall"]
+        return {
+            "variant": result["variant"],
+            "parameters": result.get("parameter_count"),
+            "ppl": dataset["ppl"]["ppl"],
+            "sink_paper_style": probe["paper_style_mean"],
+            "sink_prefix_excluded": probe["prefix_excluded_mean"],
+            "gate_mean": gate["mean"],
+            "gate_fraction_lt_0_1": gate["fraction_lt_0_1"],
+        }
+    return {
+        "variant": result["variant"],
+        "parameters": result.get("parameter_count"),
+        "ppl": result.get("ppl", result.get("legacy_text_ppl")),
+        "sink_paper_style": result.get(
+            "mean_first_token_rate", result.get("prompt", {}).get("paper_style_mean")
+        ),
+        "sink_prefix_excluded": None,
+        "gate_mean": None,
+        "gate_fraction_lt_0_1": None,
+    }
+
+
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--results_dir", required=True)
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results_dir", required=True)
+    args = parser.parse_args()
+    results_dir = Path(args.results_dir)
 
-    rows = []
-    for f in sorted(glob.glob(os.path.join(args.results_dir, "results_*.json"))):
-        with open(f) as fh:
-            rows.append(json.load(fh))
-
+    rows = [
+        flatten_result(json.loads(path.read_text()))
+        for path in sorted(results_dir.glob("results_*.json"))
+    ]
     if not rows:
-        print("No results_*.json found in", args.results_dir)
-        return
+        raise FileNotFoundError(f"No results_*.json under {results_dir}")
 
-    print("\n=== Attention-sink comparison (mean first-token attention rate) ===")
-    print(f"{'variant':16s} {'mean_rate':>10s}   {'PPL':>10s}")
-    print("-" * 42)
-    for r in rows:
-        ppl = r.get("ppl")
-        print(f"{r['variant']:16s} {r['mean_first_token_rate']:10.4f}   {('%.3f' % ppl) if ppl else '  n/a':>10s}")
+    columns = list(rows[0])
+    with (results_dir / "summary.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
 
-    # bar chart
-    variants = [r["variant"] for r in rows]
-    rates = [r["mean_first_token_rate"] for r in rows]
-    colors = ["#d62728" if v == "baseline" else "#2ca02c" for v in variants]
-    fig, ax = plt.subplots(figsize=(7, 4.5))
-    bars = ax.bar(variants, rates, color=colors)
-    ax.set_ylabel("mean first-token attention rate")
-    ax.set_title("Attention sink: baseline vs gated")
-    for b, r in zip(bars, rates):
-        ax.text(b.get_x() + b.get_width() / 2, r + 0.005, f"{r:.3f}", ha="center")
-    ax.set_ylim(0, max(rates) * 1.2 + 0.01)
-    plt.tight_layout()
-    out = os.path.join(args.results_dir, "attention_sink_comparison.png")
-    plt.savefig(out, dpi=120)
-    plt.close()
-    print(f"\nbar chart -> {out}")
+    print("\n=== Phase A: official checkpoint comparison ===")
+    print(f"{'variant':18s} {'sink':>10s} {'trimmed':>10s} {'PPL':>10s}")
+    for row in rows:
+        trimmed = row["sink_prefix_excluded"]
+        ppl = row["ppl"]
+        print(
+            f"{row['variant']:18s} {row['sink_paper_style']:10.4f} "
+            f"{trimmed if trimmed is not None else float('nan'):10.4f} "
+            f"{ppl if ppl is not None else float('nan'):10.3f}"
+        )
+
+    variants = [row["variant"] for row in rows]
+    paper = [row["sink_paper_style"] for row in rows]
+    trimmed = [row["sink_prefix_excluded"] for row in rows]
+    positions = list(range(len(rows)))
+    width = 0.38
+    fig, axis = plt.subplots(figsize=(8, 4.8))
+    axis.bar([x - width / 2 for x in positions], paper, width, label="paper-style")
+    if all(value is not None for value in trimmed):
+        axis.bar(
+            [x + width / 2 for x in positions],
+            trimmed,
+            width,
+            label="exclude first 4 queries",
+        )
+    axis.set_xticks(positions, labels=variants)
+    axis.set_ylabel("mean first-token attention")
+    axis.set_title("Phase A attention sink")
+    axis.legend()
+    fig.tight_layout()
+    chart = results_dir / "attention_sink_comparison.png"
+    fig.savefig(chart, dpi=140)
+    plt.close(fig)
+    print(f"summary -> {results_dir / 'summary.csv'}")
+    print(f"chart   -> {chart}")
 
 
 if __name__ == "__main__":

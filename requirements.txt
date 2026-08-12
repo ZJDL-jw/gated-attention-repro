@@ -12,9 +12,9 @@ transformers==4.51.3
 # Pin a 2.x that pairs with 4.51.3:
 torch>=2.1,<2.6
 
-numpy
-matplotlib
-safetensors
-huggingface_hub
-datasets
-accelerate
+numpy==1.26.4
+matplotlib==3.8.3
+safetensors==0.8.0
+huggingface_hub==0.36.2
+datasets==3.6.0
+accelerate==1.14.0
