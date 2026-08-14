@@ -188,6 +188,7 @@ def plot_context_results(runs, output_dir):
         xlabel="processed tokens",
         ylabel="validation PPL",
         title="Context-length PPL during training",
+        yscale="log",
     )
     if plotted:
         axis.legend(fontsize=8, ncol=2)
@@ -217,6 +218,7 @@ def plot_context_results(runs, output_dir):
         xscale="log",
     )
     axis.set_xticks([512, 1024, 2048, 4096], labels=["512", "1024", "2048", "4096"])
+    axis.minorticks_off()
     if plotted:
         axis.legend()
     fig.tight_layout()
@@ -263,8 +265,45 @@ def write_summary(runs, output_dir):
             f"{row['sink_prefix_excluded']:.4f} | {row.get('ppl_2048', float('nan')):.3f} | "
             f"{row.get('ppl_4096', float('nan')):.3f} |"
         )
+
     lines.extend(
         [
+            "",
+            "## Aggregate across seeds",
+            "",
+            "| variant | n | sink (mean +/- SD) | PPL@2048 (mean +/- SD) | PPL@4096 (mean +/- SD) |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for variant in sorted({row["variant"] for row in rows}):
+        group = [row for row in rows if row["variant"] == variant]
+
+        def mean_sd(key):
+            values = [float(row[key]) for row in group if key in row]
+            if not values:
+                return float("nan"), float("nan")
+            mean = statistics.mean(values)
+            sd = statistics.stdev(values) if len(values) > 1 else float("nan")
+            return mean, sd
+
+        sink_mean, sink_sd = mean_sd("sink_prefix_excluded")
+        ppl_2048_mean, ppl_2048_sd = mean_sd("ppl_2048")
+        ppl_4096_mean, ppl_4096_sd = mean_sd("ppl_4096")
+        metric_text = lambda value, digits: f"{value:.{digits}f}" if math.isfinite(value) else "n/a"
+        lines.append(
+            f"| {variant} | {len(group)} | {metric_text(sink_mean, 4)} +/- {metric_text(sink_sd, 4)} | "
+            f"{metric_text(ppl_2048_mean, 3)} +/- {metric_text(ppl_2048_sd, 4)} | "
+            f"{metric_text(ppl_4096_mean, 3)} +/- {metric_text(ppl_4096_sd, 4)} |"
+        )
+    lines.extend(
+        [
+            "",
+            "These runs use about 200M parameters and 500M training tokens. "
+            "Baseline and elementwise use three seeds; headwise uses one seed. "
+            "The 4096-token evaluation is zero-shot RoPE extrapolation beyond the "
+            "2048-token training length, not a substitute for long-context continued "
+            "pretraining or RULER. Treat the curves as dynamics and correlation evidence, "
+            "not a causal proof or a full-scale reproduction.",
             "",
             "![training loss](train_loss.png)",
             "",
