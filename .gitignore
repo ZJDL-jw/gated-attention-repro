@@ -21,6 +21,10 @@ data/.*.build-*/
 results/**/*.png
 results/**/*.pdf
 
+# ---- Runtime logs (keep only the curated, compact audit log) ----
+logs/*
+!logs/reproduction_summary.log
+
 # ---- OS / editor ----
 .DS_Store
 .idea/
