@@ -23,6 +23,9 @@ introduces (1) non-linearity breaking the low-rank `Wv→Wo` bottleneck and
 | `src/our/metrics.py`, `compare_runs.py` | Shared metrics and final result aggregation. |
 | `scripts/run_smoke.sh`, `run_eval_1b.sh`, `run_train.sh` | One-click launchers. |
 | `docs/reproduction_plan.md` | Complete experiment design, metrics, commands, and limits. |
+| `docs/environment_manifest.md` | Captured hardware, software, code, data, and run topology. |
+| `docs/executed_commands.md` | Normalized command record reconstructed from run evidence. |
+| `logs/reproduction_summary.log` | Compact completion log; raw console logs and caches are excluded. |
 | `requirements.txt` | Pinned dependencies. |
 
 ## Reproduction roadmap

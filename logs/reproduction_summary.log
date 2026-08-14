@@ -1,0 +1,37 @@
+# Compact reproduction log
+# Generated from run manifests, trainer states, curated result files, and key
+# events in the original console logs. Durations are trainer-reported seconds.
+# Raw progress bars, caches, model weights, datasets, and absolute run paths are
+# intentionally excluded.
+
+[smoke]
+gate_validation status=passed
+variant=baseline seed=20 params=190396416 world_size=2 steps=123 processed_tokens=2015232 train_runtime_s=295.0985 train_loss=7.406025134451021 status=complete
+variant=headwise seed=20 params=190445568 world_size=2 steps=123 processed_tokens=2015232 train_runtime_s=293.8420 train_loss=7.047503998609093 status=complete
+variant=elementwise seed=20 params=193542144 world_size=2 steps=123 processed_tokens=2015232 train_runtime_s=298.4528 train_loss=7.080797482312210 status=complete
+analysis runs=3 snapshots_per_run=9 summary=results/smoke/summary.csv status=complete
+
+[phaseA]
+variant=baseline ppl=13.250132508950644 sink_paper=0.4265829512275689 status=complete
+variant=gate_headwise ppl=13.176464658219297 sink_paper=0.05251425696509874 gate_mean=0.25715226786477224 status=complete
+variant=gate_elementwise ppl=13.237927418840325 sink_paper=0.018681715126149356 gate_mean=0.13979429006576538 status=complete
+summary=results/phaseA/summary.csv status=complete
+
+[phaseB]
+variant=baseline seed=20 params=190396416 world_size=2 steps=30518 processed_tokens=500006912 train_runtime_s=8235.8994 train_loss=3.9267463480334848 snapshots=9 status=complete
+variant=baseline seed=21 params=190396416 world_size=2 steps=30518 processed_tokens=500006912 train_runtime_s=8245.8722 train_loss=3.9174662033847043 snapshots=9 status=complete
+variant=baseline seed=22 params=190396416 world_size=2 steps=30518 processed_tokens=500006912 train_runtime_s=8270.9987 train_loss=3.9365148580561020 snapshots=9 status=complete
+variant=headwise seed=20 params=190445568 world_size=2 steps=30518 processed_tokens=500006912 train_runtime_s=8307.2662 train_loss=3.8921476240137456 snapshots=9 status=complete
+variant=elementwise seed=20 params=193542144 world_size=2 steps=30518 processed_tokens=500006912 train_runtime_s=8391.5831 train_loss=3.8880417960852110 snapshots=9 status=complete
+variant=elementwise seed=21 params=193542144 world_size=2 steps=30518 processed_tokens=500006912 train_runtime_s=8417.9900 train_loss=3.8901001344432413 snapshots=9 status=complete
+variant=elementwise seed=22 params=193542144 world_size=2 steps=30518 processed_tokens=500006912 train_runtime_s=8390.6121 train_loss=3.8808441230233433 snapshots=9 status=complete
+analysis runs=7 snapshots_per_run=9 summary=results/phaseB/summary.csv status=complete
+
+[recovery]
+event=post_analysis_aggregation initial_status=failed reason="bare python executable not found after all seed-21/22 training and analysis completed"
+event=post_analysis_aggregation recovery="rerun compare_runs.py with .venv/bin/python" runs_in_summary=7 status=complete
+
+[validation]
+check="python -m unittest discover -s tests -v" passed=24 failed=0 status=complete
+check="python -m py_compile src/our/compare_runs.py" status=complete
+check="formal dynamics audit" runs=7 snapshots_each=9 finite_json=true token_budgets_match=true status=complete
